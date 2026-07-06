@@ -25,6 +25,8 @@ services_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="Стрижка")],
         [KeyboardButton(text="Консультация")],
         [KeyboardButton(text="Диагностика")],
+        [KeyboardButton(text="Окрашивание")],
+        [KeyboardButton(text="Запись на звонок")],
     ],
     resize_keyboard=True,
 )
@@ -39,7 +41,7 @@ async def start_handler(message: Message):
     )
 
 
-@dp.message(F.text.in_(["Стрижка", "Консультация", "Диагностика"]))
+@dp.message(F.text.in_(["Стрижка", "Консультация", "Диагностика", "Окрашивание", "Запись на звонок"]))
 async def service_handler(message: Message):
     logging.info(f"Got service: {message.text}")
     await message.answer(f"Вы выбрали услугу: {message.text}")
@@ -50,6 +52,12 @@ async def any_message(message: Message):
     logging.info(f"Got message: {message.text!r}")
     await message.answer("Я получил сообщение. Нажмите /start или выберите услугу.")
 
+@dp.message()
+async def unknown_message_handler(message: Message):
+    await message.answer(
+        "Я пока понимаю только выбор услуги. Нажмите одну из кнопок ниже.",
+        reply_markup=services_keyboard
+    )
 
 async def precheck(bot: Bot):
     info = await bot.get_me()
