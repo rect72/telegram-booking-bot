@@ -2,23 +2,26 @@ import asyncio
 import logging
 import os
 import re
-
-from aiogram import Bot, Dispatcher
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiohttp import ClientTimeout, TCPConnector
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-
+from datetime import datetime
 from pathlib import Path
 
-
-from config import BOT_TOKEN
-
-from datetime import datetime
+from aiohttp import ClientTimeout, TCPConnector
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    BotCommand,
+    FSInputFile,
+    ReplyKeyboardRemove,  # ✅ добавили
+)
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
+from config import BOT_TOKEN
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +34,6 @@ logging.getLogger("aiogram").setLevel(logging.INFO)
 dp = Dispatcher()
 
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
-
 
 services_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -49,11 +51,30 @@ cancel_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+time_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="10:00")],
+        [KeyboardButton(text="12:00")],
+        [KeyboardButton(text="14:00")],
+        [KeyboardButton(text="16:00")],
+    ],
+    resize_keyboard=True,
+)
+
 confirm_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Подтвердить")],
         [KeyboardButton(text="Изменить")],
         [KeyboardButton(text="Отменить")],
+    ],
+    resize_keyboard=True,
+)
+
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Количество заявок")],
+        [KeyboardButton(text="Последние заявки")],
+        [KeyboardButton(text="Выгрузить Excel")],
     ],
     resize_keyboard=True,
 )
@@ -65,62 +86,44 @@ EXCEL_PATH = str(BASE_DIR / "заявки.xlsx")
 EXCEL_SHEET = "Заявки"
 EXCEL_HEADERS = ["timestamp", "service", "name", "phone", "datetime_text", "comment"]
 
-def save_order_to_excel(data: dict) -> None:
+
+def is_valid_phone(phone: str) -> bool:
     """
-    Сохраняет заявку в Excel.
-    Не падает: любые ошибки логируются, бот продолжает работу.
+    Разрешаем ТОЛЬКО:
+    +7XXXXXXXXXX (11 цифр после +7) или 8XXXXXXXXXX (11 цифр, первая 8)
+    Т.е. строго 12 символов с + (пример +79991234567) или 11 символов без + (89991234567)
     """
-    try:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not phone:
+        return False
 
-        # Если Excel не существует — создаём
-        try:
-            wb = load_workbook(EXCEL_PATH)
-        except FileNotFoundError:
-            wb = Workbook()
-        except InvalidFileException:
-            # файл есть, но он битый/не Excel
-            wb = Workbook()
-        except PermissionError as e:
-            logging.error(f"Excel недоступен (PermissionError): {e}")
-            return
-        except OSError as e:
-            logging.error(f"Excel недоступен (OSError): {e}")
-            return
+    s = phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    return bool(re.fullmatch(r"(\+7\d{10}|8\d{10})", s))
 
-        # Лист
-        if EXCEL_SHEET in wb.sheetnames:
-            ws = wb[EXCEL_SHEET]
-        else:
-            ws = wb.create_sheet(EXCEL_SHEET)
-            ws.append(EXCEL_HEADERS)
 
-        # На случай пустого нового файла
-        if ws.max_row == 0 or (ws.max_row == 1 and ws.cell(1, 1).value is None):
-            ws.append(EXCEL_HEADERS)
+def is_valid_datetime_text(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+    t = text.strip()
+    return bool(
+        re.search(r"\d{1,2}\s*[^\d]*\d{1,2}:\d{2}", t, re.IGNORECASE)
+        or re.search(r"\d{1,2}:\d{2}", t)
+    )
 
-        ws.append([
-            ts,
-            data.get("service"),
-            data.get("name"),
-            data.get("phone"),
-            data.get("datetime"),
-            data.get("comment", "Нет"),
-        ])
 
-        # Сохранение
-        try:
-            wb.save(EXCEL_PATH)
-        except PermissionError as e:
-            logging.error(f"Не удалось сохранить Excel (PermissionError): {e}")
-            return
-        except OSError as e:
-            logging.error(f"Не удалось сохранить Excel (OSError): {e}")
-            return
+def is_valid_date_text(text: str) -> bool:
+    if not text or not text.strip():
+        return False
 
-    except Exception:
-        # важно: бот не ломаем
-        logging.exception("save_order_to_excel: неожиданная ошибка, заявка не сохранена")
+    t = text.strip().lower()
+
+    months = (
+        "января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря|"
+        "янв|фев|мар|апр|май|июн|июл|авг|сен|окт|ноя|дек"
+    )
+
+    pattern = rf"^\s*(0?[1-9]|[12]\d|3[01])\s+({months})(\s+\d{{4}})?\s*$"
+    return bool(re.match(pattern, t, re.IGNORECASE))
+
 
 async def notify_admin(bot: Bot, text: str) -> None:
     if not ADMIN_CHAT_ID:
@@ -130,46 +133,6 @@ async def notify_admin(bot: Bot, text: str) -> None:
     except Exception:
         logging.exception("Не удалось отправить заявку админу (бот не падает)")
 
-
-
-def is_valid_phone(phone: str) -> bool:
-    if not phone:
-        return False
-
-    digits = "".join(ch for ch in phone if ch.isdigit())
-
-    if len(digits) < 10:
-        return False
-
-    if phone.startswith("+7"):
-        return True
-
-    if phone.startswith("8"):
-        return True
-
-    if len(digits) >= 10:
-        return True
-
-    return False
-
-
-def is_valid_datetime_text(text: str) -> bool:
-    if not text or not text.strip():
-        return False
-
-    t = text.strip()
-    return bool(
-        re.search(r"\d{1,2}\s*[^\d]*\d{1,2}:\d{2}", t, re.IGNORECASE)
-        or re.search(r"\d{1,2}:\d{2}", t)
-    )
-
-
-class OrderForm(StatesGroup):
-    waiting_for_name = State()
-    waiting_for_phone = State()
-    waiting_for_datetime = State()
-    waiting_for_comment = State()
-    waiting_for_confirmation = State()
 
 def has_empty_required_fields(data: dict) -> tuple[bool, str]:
     required = ["service", "name", "phone", "datetime", "comment"]
@@ -181,6 +144,118 @@ def has_empty_required_fields(data: dict) -> tuple[bool, str]:
             return True, f"Поле '{key}' пустое."
     return False, ""
 
+
+def save_order_to_excel(data: dict) -> None:
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            wb = load_workbook(EXCEL_PATH)
+        except FileNotFoundError:
+            wb = Workbook()
+        except InvalidFileException:
+            wb = Workbook()
+        except PermissionError as e:
+            logging.error(f"Excel недоступен (PermissionError): {e}")
+            return
+        except OSError as e:
+            logging.error(f"Excel недоступен (OSError): {e}")
+            return
+
+        if EXCEL_SHEET in wb.sheetnames:
+            ws = wb[EXCEL_SHEET]
+        else:
+            ws = wb.create_sheet(EXCEL_SHEET)
+            ws.append(EXCEL_HEADERS)
+
+        if ws.max_row == 0 or (ws.max_row == 1 and ws.cell(1, 1).value is None):
+            ws.append(EXCEL_HEADERS)
+
+        ws.append(
+            [
+                ts,
+                data.get("service"),
+                data.get("name"),
+                data.get("phone"),
+                data.get("datetime"),
+                data.get("comment", "Нет"),
+            ]
+        )
+
+        try:
+            wb.save(EXCEL_PATH)
+        except PermissionError as e:
+            logging.error(f"Не удалось сохранить Excel (PermissionError): {e}")
+            return
+        except OSError as e:
+            logging.error(f"Не удалось сохранить Excel (OSError): {e}")
+            return
+
+    except Exception:
+        logging.exception("save_order_to_excel: неожиданная ошибка, заявка не сохранена")
+
+
+def load_orders_from_excel(limit: int = 10) -> list[list[str]]:
+    try:
+        wb = load_workbook(EXCEL_PATH)
+        if EXCEL_SHEET not in wb.sheetnames:
+            return []
+
+        ws = wb[EXCEL_SHEET]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return []
+
+        data_rows = rows[1:] if len(rows) > 1 else []
+        data_rows = data_rows[-limit:] if limit else data_rows
+
+        result: list[list[str]] = []
+        for r in data_rows:
+            result.append([("" if v is None else str(v)) for v in r])
+
+        return result
+
+    except FileNotFoundError:
+        return []
+    except InvalidFileException:
+        return []
+    except PermissionError as e:
+        logging.error(f"Excel PermissionError: {e}")
+        return []
+    except OSError as e:
+        logging.error(f"Excel OSError: {e}")
+        return []
+    except Exception:
+        logging.exception("load_orders_from_excel: неожиданная ошибка")
+        return []
+
+
+def get_orders_count() -> int:
+    try:
+        wb = load_workbook(EXCEL_PATH)
+        if EXCEL_SHEET not in wb.sheetnames:
+            return 0
+        ws = wb[EXCEL_SHEET]
+        if ws.max_row <= 1:
+            return 0
+        return ws.max_row - 1
+    except Exception:
+        return 0
+
+
+class OrderForm(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_phone = State()
+    waiting_for_date = State()
+    waiting_for_time = State()
+    waiting_for_comment = State()
+    waiting_for_confirmation = State()
+
+
+def is_admin(user_id: int) -> bool:
+    if not ADMIN_CHAT_ID:
+        return False
+    return str(user_id) == str(ADMIN_CHAT_ID)
 
 
 @dp.message(CommandStart())
@@ -227,7 +302,7 @@ async def process_name(message: Message, state: FSMContext):
     await state.update_data(name=name)
     await state.set_state(OrderForm.waiting_for_phone)
     await message.answer(
-        "Введите ваш телефон. Например: +79991234567 или 89991234567",
+        "Введите ваш телефон. Пример: +79991234567 или 89991234567",
         reply_markup=cancel_keyboard,
     )
 
@@ -239,45 +314,74 @@ async def process_phone(message: Message, state: FSMContext):
     if not is_valid_phone(phone):
         await message.answer(
             "Телефон введён неверно.\n"
-            "Введите телефон ещё раз.\n\n"
-            "Примеры:\n"
-            "+79991234567\n"
-            "89991234567",
+            "Формат: +79991234567 или 89991234567 (ровно 11 цифр после 7/в начале 8).",
             reply_markup=cancel_keyboard,
         )
         return
 
     await state.update_data(phone=phone)
-    await state.set_state(OrderForm.waiting_for_datetime)
+    await state.set_state(OrderForm.waiting_for_date)
     await message.answer(
-        "Введите дату и время записи.\n"
-        "Например: 5 июля в 15:00",
+        "Введите дату записи.\nНапример: 5 июля или 05 июля 2026",
         reply_markup=cancel_keyboard,
     )
 
 
-@dp.message(OrderForm.waiting_for_datetime)
-async def process_datetime(message: Message, state: FSMContext):
-    datetime_text = (message.text or "").strip()
+@dp.message(OrderForm.waiting_for_date)
+async def process_date(message: Message, state: FSMContext):
+    date_text = (message.text or "").strip()
 
-    if not datetime_text:
+    if not date_text:
         await message.answer(
-            "Дата и время не должны быть пустыми.\n"
-            "Например: 5 июля в 15:00",
+            "Дата не должна быть пустой.\nНапример: 5 июля",
             reply_markup=cancel_keyboard,
         )
         return
 
-    if not is_valid_datetime_text(datetime_text):
+    if not is_valid_date_text(date_text):
         await message.answer(
-            "Дата и время введены неверно.\n"
-            "Например: 5 июля в 15:00",
+            "Дата введена неверно.\n"
+            "Пример: 5 июля или 5 июля 2026",
             reply_markup=cancel_keyboard,
         )
+        return
+
+    await state.update_data(date=date_text)
+    await state.set_state(OrderForm.waiting_for_time)
+
+    await message.answer("Выберите время:", reply_markup=time_keyboard)
+
+
+@dp.message(OrderForm.waiting_for_time)
+async def process_time(message: Message, state: FSMContext):
+    time_text = (message.text or "").strip()
+    allowed_times = {"10:00", "12:00", "14:00", "16:00"}
+
+    if time_text not in allowed_times:
+        await message.answer("Выберите время кнопками:", reply_markup=time_keyboard)
+        return
+
+    data = await state.get_data()
+    date_text = data.get("date", "").strip()
+
+    if not date_text:
+        await state.set_state(OrderForm.waiting_for_date)
+        await message.answer("Введите дату заново:", reply_markup=cancel_keyboard)
+        return
+
+    datetime_text = f"{date_text} {time_text}"
+
+    if not is_valid_datetime_text(datetime_text):
+        await message.answer(
+            "Дата/время введены некорректно. Попробуйте ещё раз.\nВведите дату:",
+            reply_markup=cancel_keyboard,
+        )
+        await state.set_state(OrderForm.waiting_for_date)
         return
 
     await state.update_data(datetime=datetime_text)
     await state.set_state(OrderForm.waiting_for_comment)
+
     await message.answer(
         "Введите комментарий к заявке.\n"
         "Если комментария нет, напишите: Нет",
@@ -295,14 +399,14 @@ async def process_comment(message: Message, state: FSMContext):
         comment = "Нет"
 
     await state.update_data(comment=comment)
+
     data = await state.get_data()
     is_empty, err_text = has_empty_required_fields(data)
     if is_empty:
         await state.set_state(OrderForm.waiting_for_name)
         await message.answer(
-            f"Не все обязательные поля заполнены: {err_text}\n"
-            "Введите ваше имя:",
-            reply_markup=cancel_keyboard
+            f"Не все обязательные поля заполнены: {err_text}\nВведите ваше имя:",
+            reply_markup=cancel_keyboard,
         )
         return
 
@@ -316,22 +420,22 @@ async def process_comment(message: Message, state: FSMContext):
     )
 
     await state.set_state(OrderForm.waiting_for_confirmation)
-    logging.info("STATE -> waiting_for_confirmation")
-
     await message.answer(text, reply_markup=confirm_keyboard)
 
 
+# ✅ ИСПРАВЛЕНИЕ: убираем клавиатуру после нажатия кнопок
 @dp.message(OrderForm.waiting_for_confirmation)
 async def process_confirmation(message: Message, state: FSMContext, bot: Bot):
-    logging.info("ENTER process_confirmation")
     answer = (message.text or "").strip()
 
     if answer == "Подтвердить":
         data = await state.get_data()
 
+        await state.clear()
         await message.answer(
             "Заявка подтверждена. Спасибо!\n"
             "Мы свяжемся с вами в ближайшее время.",
+            reply_markup=ReplyKeyboardRemove(),  # ✅ кнопки пропадают
         )
 
         text_to_admin = (
@@ -343,28 +447,15 @@ async def process_confirmation(message: Message, state: FSMContext, bot: Bot):
             f"Комментарий: {data.get('comment')}"
         )
 
-        try:
-            await notify_admin(bot, text_to_admin)
-        except Exception:
-            logging.exception("Ошибка при отправке заявки админу, бот не падает")
-
-        try:
-            save_order_to_excel(data)
-        except Exception:
-            logging.exception("Ошибка при сохранении заявки (обёртка), бот не падает")
-
-        print("Новая заявка:")
-        print(data)
-
-        await state.clear()
+        await notify_admin(bot, text_to_admin)
+        save_order_to_excel(data)
         return
 
     if answer == "Изменить":
-        await state.set_state(OrderForm.waiting_for_name)
+        await state.clear()
         await message.answer(
-            "Хорошо, заполним заявку заново.\n"
-            "Введите ваше имя:",
-            reply_markup=cancel_keyboard,
+            "Ок, заполним заявку заново. Выберите услугу:",
+            reply_markup=services_keyboard,  # ✅ заменяем клавиатуру на новую
         )
         return
 
@@ -372,7 +463,7 @@ async def process_confirmation(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         await message.answer(
             "Заявка отменена. Чтобы начать заново, нажмите /start.",
-            reply_markup=services_keyboard,
+            reply_markup=services_keyboard,  # ✅ заменяем клавиатуру на новую
         )
         return
 
@@ -380,6 +471,78 @@ async def process_confirmation(message: Message, state: FSMContext, bot: Bot):
         "Пожалуйста, выберите одну из кнопок:\n"
         "Подтвердить / Изменить / Отменить",
         reply_markup=confirm_keyboard,
+    )
+
+
+# -------------------- ADMIN (ОБНОВЛЁННЫЙ ОДИН РАЗ) --------------------
+
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    if not message.from_user:
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    count = get_orders_count()
+    await message.answer(
+        f"Админ-панель\n\nКоличество заявок: {count}",
+        reply_markup=ADMIN_KEYBOARD,
+    )
+
+
+@dp.message(lambda m: m.text == "Количество заявок")
+async def admin_count(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    await message.answer(f"Количество заявок: {get_orders_count()}")
+
+
+@dp.message(lambda m: m.text == "Последние заявки")
+async def admin_last_orders(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    orders = load_orders_from_excel(limit=10)
+    if not orders:
+        await message.answer("Заявок пока нет.")
+        return
+
+    lines = ["Последние заявки:"]
+    for i, row in enumerate(orders, start=1):
+        ts = row[0] if len(row) > 0 else ""
+        service = row[1] if len(row) > 1 else ""
+        name = row[2] if len(row) > 2 else ""
+        phone = row[3] if len(row) > 3 else ""
+        dt = row[4] if len(row) > 4 else ""
+        comment = row[5] if len(row) > 5 else ""
+
+        lines.append(
+            f"{i}) {service}\n"
+            f"   {name} | {phone}\n"
+            f"   {dt}\n"
+            f"   Комм: {comment}\n"
+            f"   ({ts})"
+        )
+
+    await message.answer("\n".join(lines))
+
+
+@dp.message(lambda m: m.text == "Выгрузить Excel")
+async def admin_export_excel(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    if not os.path.exists(EXCEL_PATH):
+        await message.answer("Excel-файл не найден. Сначала создайте хотя бы одну заявку.")
+        return
+
+    await message.answer_document(
+        FSInputFile(EXCEL_PATH),
+        caption="Выгрузка заявок (Excel)"
     )
 
 
@@ -396,11 +559,18 @@ async def precheck(bot: Bot):
     logging.info(f"Telegram reachable. Bot username: @{info.username}")
 
 
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Открыть меню"),
+        BotCommand(command="admin", description="Админ-панель"),
+    ]
+    await bot.set_my_commands(commands)
+
+
 async def main():
     PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
     timeout = ClientTimeout(total=120, connect=60, sock_connect=60, sock_read=60)
-
     connector = TCPConnector(
         limit=0,
         limit_per_host=0,
@@ -419,6 +589,7 @@ async def main():
             logging.info(f"Excel path: {EXCEL_PATH}")
             logging.info("Precheck: calling getMe()...")
             await precheck(bot)
+            await set_bot_commands(bot)
             logging.info("Starting polling...")
             await dp.start_polling(bot)
         except Exception as e:
